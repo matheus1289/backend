@@ -1,0 +1,67 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# ── Ambiente Virtual ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ── Variáveis de Ambiente (NUNCA subir!) ──────────────────────────────────
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# ── Planilha Excel (dados locais, não vão pro Railway) ────────────────────
+*.xlsx
+*.xls
+*.csv
+
+# ── Arquivos temporários ──────────────────────────────────────────────────
+*.tmp
+*.temp
+tmp/
+temp/
+
+# ── Sistema Operacional ───────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+
+# ── VS Code ───────────────────────────────────────────────────────────────
+.vscode/
+*.code-workspace
+
+# ── PyCharm / IDEs ────────────────────────────────────────────────────────
+.idea/
+*.iml
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Pytest / Testes ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
