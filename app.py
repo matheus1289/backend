@@ -28,56 +28,67 @@ def init_db():
     """Cria as tabelas se não existirem."""
     conn = get_conn()
     cur  = conn.cursor()
+    lock_id = 734512901
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lancamentos (
-            id         SERIAL PRIMARY KEY,
-            mes        VARCHAR(20),
-            data       VARCHAR(20),
-            descricao  TEXT NOT NULL,
-            categoria  VARCHAR(50),
-            tipo       VARCHAR(10) NOT NULL,
-            valor      NUMERIC(12,2) NOT NULL,
-            pagamento  VARCHAR(50),
-            obs        TEXT,
-            criado_em  TIMESTAMP DEFAULT NOW()
-        );
-    """)
+    try:
+        # Evita corrida entre workers ao criar schema no startup.
+        cur.execute("SELECT pg_advisory_lock(%s)", (lock_id,))
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS fixos (
-            id         SERIAL PRIMARY KEY,
-            tipo       VARCHAR(10) NOT NULL,
-            descricao  TEXT NOT NULL,
-            valor      NUMERIC(12,2) NOT NULL,
-            categoria  VARCHAR(50),
-            pagamento  VARCHAR(50),
-            ativo      BOOLEAN DEFAULT TRUE
-        );
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lancamentos (
+                id         SERIAL PRIMARY KEY,
+                mes        VARCHAR(20),
+                data       VARCHAR(20),
+                descricao  TEXT NOT NULL,
+                categoria  VARCHAR(50),
+                tipo       VARCHAR(10) NOT NULL,
+                valor      NUMERIC(12,2) NOT NULL,
+                pagamento  VARCHAR(50),
+                obs        TEXT,
+                criado_em  TIMESTAMP DEFAULT NOW()
+            );
+        """)
 
-    # Insere fixos padrão se tabela estiver vazia
-    cur.execute("SELECT COUNT(*) FROM fixos;")
-    if cur.fetchone()[0] == 0:
-        fixos_padrao = [
-            ('ENTRADA', 'Salário',          5000.00, 'Salário',           ''),
-            ('ENTRADA', 'Aluguel Imóvel',   1200.00, 'Outros (Entrada)',   ''),
-            ('ENTRADA', 'CDB/Dividendos',    300.00, 'Investimentos',      ''),
-            ('SAÍDA',   'Aluguel Apt.',     1500.00, 'Moradia',            'Débito Automático'),
-            ('SAÍDA',   'Plano de Saúde',    280.00, 'Saúde',              'Débito Automático'),
-            ('SAÍDA',   'Internet',          100.00, 'Contas/Serviços',    'Débito Automático'),
-            ('SAÍDA',   'Academia',           90.00, 'Saúde',              'Débito Automático'),
-            ('SAÍDA',   'Netflix',            45.00, 'Lazer',              'Cartão Crédito'),
-            ('SAÍDA',   'Spotify',            21.00, 'Lazer',              'Cartão Crédito'),
-        ]
-        cur.executemany("""
-            INSERT INTO fixos (tipo, descricao, valor, categoria, pagamento)
-            VALUES (%s, %s, %s, %s, %s)
-        """, fixos_padrao)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS fixos (
+                id         SERIAL PRIMARY KEY,
+                tipo       VARCHAR(10) NOT NULL,
+                descricao  TEXT NOT NULL,
+                valor      NUMERIC(12,2) NOT NULL,
+                categoria  VARCHAR(50),
+                pagamento  VARCHAR(50),
+                ativo      BOOLEAN DEFAULT TRUE
+            );
+        """)
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        # Insere fixos padrão se tabela estiver vazia
+        cur.execute("SELECT COUNT(*) FROM fixos;")
+        if cur.fetchone()[0] == 0:
+            fixos_padrao = [
+                ('ENTRADA', 'Salário',          5000.00, 'Salário',           ''),
+                ('ENTRADA', 'Aluguel Imóvel',   1200.00, 'Outros (Entrada)',   ''),
+                ('ENTRADA', 'CDB/Dividendos',    300.00, 'Investimentos',      ''),
+                ('SAÍDA',   'Aluguel Apt.',     1500.00, 'Moradia',            'Débito Automático'),
+                ('SAÍDA',   'Plano de Saúde',    280.00, 'Saúde',              'Débito Automático'),
+                ('SAÍDA',   'Internet',          100.00, 'Contas/Serviços',    'Débito Automático'),
+                ('SAÍDA',   'Academia',           90.00, 'Saúde',              'Débito Automático'),
+                ('SAÍDA',   'Netflix',            45.00, 'Lazer',              'Cartão Crédito'),
+                ('SAÍDA',   'Spotify',            21.00, 'Lazer',              'Cartão Crédito'),
+            ]
+            cur.executemany("""
+                INSERT INTO fixos (tipo, descricao, valor, categoria, pagamento)
+                VALUES (%s, %s, %s, %s, %s)
+            """, fixos_padrao)
+
+        conn.commit()
+    finally:
+        try:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        cur.close()
+        conn.close()
 
 
 def bootstrap_database():
