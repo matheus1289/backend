@@ -307,6 +307,78 @@ def listar_lancamentos():
         return jsonify({"erro": str(e)}), 500
 
 
+@app.route('/api/lancamentos/<int:lancamento_id>', methods=['PUT'])
+def editar_lancamento(lancamento_id):
+    try:
+        dados = request.json or {}
+
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM lancamentos WHERE id=%s", (lancamento_id,))
+        atual = cur.fetchone()
+
+        if not atual:
+            cur.close(); conn.close()
+            return jsonify({"erro": "Lançamento não encontrado"}), 404
+
+        data = str(dados.get('data', atual['data'])).strip()
+        descricao = str(dados.get('descricao', atual['descricao'])).strip()
+        categoria = str(dados.get('categoria', atual['categoria'] or '')).strip()
+        tipo = str(dados.get('tipo', atual['tipo'])).upper().strip()
+        pagamento = str(dados.get('pagamento', atual['pagamento'] or '')).strip()
+        obs = str(dados.get('obs', atual['obs'] or '')).strip()
+
+        valor_recebido = dados.get('valor', atual['valor'])
+        try:
+            valor = float(valor_recebido)
+        except (TypeError, ValueError):
+            cur.close(); conn.close()
+            return jsonify({"erro": "Valor inválido"}), 400
+
+        if not data or not descricao or not categoria or tipo not in ('ENTRADA', 'SAÍDA') or valor <= 0:
+            cur.close(); conn.close()
+            return jsonify({"erro": "Dados inválidos para atualização"}), 400
+
+        mes = mes_da_data(data)
+        if not mes:
+            cur.close(); conn.close()
+            return jsonify({"erro": "Data inválida"}), 400
+
+        cur2 = conn.cursor()
+        cur2.execute("""
+            UPDATE lancamentos
+            SET mes=%s, data=%s, descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
+            WHERE id=%s
+        """, (mes, data, descricao, categoria, tipo, valor, pagamento, obs, lancamento_id))
+
+        conn.commit()
+        cur2.close(); cur.close(); conn.close()
+
+        return jsonify({"sucesso": True, "mes": mes}), 200
+
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route('/api/lancamentos/<int:lancamento_id>', methods=['DELETE'])
+def deletar_lancamento(lancamento_id):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM lancamentos WHERE id=%s", (lancamento_id,))
+
+        if cur.rowcount == 0:
+            conn.rollback(); cur.close(); conn.close()
+            return jsonify({"erro": "Lançamento não encontrado"}), 404
+
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"sucesso": True}), 200
+
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
 @app.route('/api/resumo', methods=['GET'])
 def resumo():
     try:
