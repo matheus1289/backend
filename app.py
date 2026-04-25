@@ -51,13 +51,29 @@ def init_db():
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fixos (
-                id         SERIAL PRIMARY KEY,
-                tipo       VARCHAR(10) NOT NULL,
-                descricao  TEXT NOT NULL,
-                valor      NUMERIC(12,2) NOT NULL,
-                categoria  VARCHAR(50),
-                pagamento  VARCHAR(50),
-                ativo      BOOLEAN DEFAULT TRUE
+                id               SERIAL PRIMARY KEY,
+                tipo             VARCHAR(10) NOT NULL,
+                descricao        TEXT NOT NULL,
+                valor            NUMERIC(12,2) NOT NULL,
+                categoria        VARCHAR(50),
+                pagamento        VARCHAR(50),
+                parcelado        BOOLEAN DEFAULT FALSE,
+                parcela_atual    INTEGER DEFAULT 1,
+                parcela_total    INTEGER DEFAULT 1,
+                data_inicio      VARCHAR(10),
+                ativo            BOOLEAN DEFAULT TRUE,
+                criado_em        TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lancamentos_gerados (
+                id               SERIAL PRIMARY KEY,
+                fixo_id          INTEGER REFERENCES fixos(id) ON DELETE CASCADE,
+                mes              VARCHAR(20),
+                ano              INTEGER,
+                valor            NUMERIC(12,2),
+                gerado_em        TIMESTAMP DEFAULT NOW()
             );
         """)
 
@@ -117,6 +133,64 @@ def mes_da_data(data_str):
         except ValueError:
             continue
     return ""
+
+def verificar_e_gerar_parcelas(mes, ano):
+    """Verifica fixos parcelados e gera lançamentos se necessário."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    
+    # Busca todos os fixos parcelados ativos
+    cur.execute("""
+        SELECT id, valor, parcela_atual, parcela_total, data_inicio, tipo
+        FROM fixos WHERE parcelado=TRUE AND ativo=TRUE
+    """)
+    fixos_parcelados = cur.fetchall()
+    
+    for fixo_id, valor, parcela_atual, parcela_total, data_inicio, tipo in fixos_parcelados:
+        if not data_inicio:
+            continue
+        
+        # Verifica se já foi gerado para este mês
+        cur.execute("""
+            SELECT id FROM lancamentos_gerados 
+            WHERE fixo_id=%s AND mes=%s AND ano=%s
+        """, (fixo_id, mes, ano))
+        
+        if cur.fetchone():
+            # Já foi gerado, pula
+            continue
+        
+        # Calcula se este mês está no range de parcelas
+        # data_inicio é "01/05/2026" (1º dia do mês inicial)
+        try:
+            dt_inicio = datetime.strptime(data_inicio, "%d/%m/%Y")
+            mes_inicio = dt_inicio.month
+            ano_inicio = dt_inicio.year
+            
+            # Calcula quantos meses passaram desde o início
+            meses_decorridos = (ano - ano_inicio) * 12 + (MESES.index(mes) - (mes_inicio - 1))
+            
+            # Se dentro do range de parcelas
+            if 0 <= meses_decorridos < parcela_total:
+                # Gera lançamento
+                cur.execute("""
+                    INSERT INTO lancamentos_gerados (fixo_id, mes, ano, valor)
+                    VALUES (%s, %s, %s, %s)
+                """, (fixo_id, mes, ano, valor))
+                
+                # Atualiza parcela_atual
+                nova_parcela = meses_decorridos + 1
+                cur.execute("""
+                    UPDATE fixos SET parcela_atual=%s WHERE id=%s
+                """, (nova_parcela, fixo_id))
+                
+                # Se chegou no final, desativa
+                if nova_parcela >= parcela_total:
+                    cur.execute("UPDATE fixos SET ativo=FALSE WHERE id=%s", (fixo_id,))
+        except ValueError:
+            continue
+    
+    conn.commit(); cur.close(); conn.close()
 
 def totais_fixos():
     """Retorna total de rendas e gastos fixos."""
@@ -229,8 +303,15 @@ def listar_lancamentos():
 def resumo():
     try:
         mes_filtro = request.args.get('mes', '').strip()
+        ano_filtro = request.args.get('ano', str(datetime.now().year)).strip()
+        
         conn = get_conn()
         cur  = conn.cursor()
+
+        # Gera parcelas se necessário
+        if mes_filtro:
+            ano = int(ano_filtro) if ano_filtro else datetime.now().year
+            verificar_e_gerar_parcelas(mes_filtro, ano)
 
         if mes_filtro:
             cur.execute("""
@@ -241,17 +322,28 @@ def resumo():
             cur.execute("SELECT tipo, SUM(valor) FROM lancamentos GROUP BY tipo")
 
         rows = cur.fetchall()
-        cur.close(); conn.close()
-
+        
         entradas = saidas = 0.0
         for tipo, total in rows:
             if tipo == 'ENTRADA': entradas = float(total or 0)
             elif tipo == 'SAÍDA': saidas   = float(total or 0)
 
-        fixos = totais_fixos()
+        # Adiciona lançamentos gerados de fixos parcelados
         if mes_filtro:
-            entradas += fixos['ENTRADA']
-            saidas   += fixos['SAÍDA']
+            cur.execute("""
+                SELECT SUM(CASE WHEN f.tipo='ENTRADA' THEN lg.valor ELSE 0 END),
+                       SUM(CASE WHEN f.tipo='SAÍDA' THEN lg.valor ELSE 0 END)
+                FROM lancamentos_gerados lg
+                JOIN fixos f ON lg.fixo_id = f.id
+                WHERE lg.mes=%s
+            """, (mes_filtro,))
+            entrada_parc, saida_parc = cur.fetchone()
+            if entrada_parc: entradas += float(entrada_parc)
+            if saida_parc: saidas += float(saida_parc)
+
+        fixos = totais_fixos()
+        
+        cur.close(); conn.close()
 
         return jsonify({
             "entradas":     round(entradas, 2),
@@ -335,10 +427,35 @@ def listar_fixos():
     try:
         conn = get_conn()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM fixos WHERE ativo=TRUE ORDER BY tipo, id")
+        cur.execute("""
+            SELECT id, tipo, descricao, valor, categoria, pagamento, 
+                   parcelado, parcela_atual, parcela_total, data_inicio, ativo
+            FROM fixos ORDER BY tipo, id
+        """)
         rows = cur.fetchall()
         cur.close(); conn.close()
-        return jsonify({"fixos": [dict(r) for r in rows]}), 200
+        
+        entradas = []
+        saidas = []
+        for r in rows:
+            item = {
+                "id": r['id'],
+                "descricao": r['descricao'],
+                "valor": float(r['valor']),
+                "categoria": r['categoria'],
+                "pagamento": r['pagamento'],
+                "parcelado": r['parcelado'],
+                "parcela_atual": r['parcela_atual'],
+                "parcela_total": r['parcela_total'],
+                "data_inicio": r['data_inicio'],
+                "ativo": r['ativo']
+            }
+            if r['tipo'] == 'ENTRADA':
+                entradas.append(item)
+            else:
+                saidas.append(item)
+        
+        return jsonify({"entradas": entradas, "saidas": saidas}), 200
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
@@ -347,19 +464,127 @@ def listar_fixos():
 def adicionar_fixo():
     try:
         dados = request.json or {}
+        
+        # Validações
+        for campo in ['tipo', 'descricao', 'valor', 'categoria']:
+            if not str(dados.get(campo, '')).strip():
+                return jsonify({"erro": f"Campo obrigatório: {campo}"}), 400
+        
+        tipo = dados['tipo'].upper()
+        if tipo not in ['ENTRADA', 'SAÍDA']:
+            return jsonify({"erro": "Tipo deve ser ENTRADA ou SAÍDA"}), 400
+        
+        parcelado = dados.get('parcelado', False)
+        if parcelado:
+            parcela_total = dados.get('parcela_total')
+            data_inicio = dados.get('data_inicio', '')
+            
+            if not parcela_total or parcela_total < 2 or parcela_total > 120:
+                return jsonify({"erro": "Parcelas devem estar entre 2 e 120"}), 400
+            if not data_inicio or not data_inicio.strip():
+                return jsonify({"erro": "Data de início é obrigatória para parcelados"}), 400
+        
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute("""
-            INSERT INTO fixos (tipo, descricao, valor, categoria, pagamento)
-            VALUES (%s, %s, %s, %s, %s) RETURNING id
+            INSERT INTO fixos (tipo, descricao, valor, categoria, pagamento, 
+                              parcelado, parcela_atual, parcela_total, data_inicio, ativo)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id
         """, (
-            dados['tipo'].upper(), dados['descricao'],
+            tipo, dados['descricao'].strip(),
             float(dados['valor']), dados.get('categoria',''),
-            dados.get('pagamento','')
+            dados.get('pagamento',''), parcelado,
+            1, dados.get('parcela_total', 1), dados.get('data_inicio', '')
         ))
         novo_id = cur.fetchone()[0]
         conn.commit(); cur.close(); conn.close()
         return jsonify({"sucesso": True, "id": novo_id}), 201
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route('/api/fixos/<int:fixo_id>', methods=['PUT'])
+def editar_fixo(fixo_id):
+    try:
+        dados = request.json or {}
+        
+        conn = get_conn()
+        cur  = conn.cursor()
+        
+        # Busca o fixo atual
+        cur.execute("SELECT * FROM fixos WHERE id=%s", (fixo_id,))
+        fixo = cur.fetchone()
+        if not fixo:
+            cur.close(); conn.close()
+            return jsonify({"erro": "Fixo não encontrado"}), 404
+        
+        # Atualiza campos fornecidos
+        campos = []
+        valores = []
+        
+        if 'descricao' in dados:
+            campos.append("descricao=%s")
+            valores.append(dados['descricao'])
+        if 'valor' in dados:
+            campos.append("valor=%s")
+            valores.append(float(dados['valor']))
+        if 'categoria' in dados:
+            campos.append("categoria=%s")
+            valores.append(dados['categoria'])
+        if 'pagamento' in dados:
+            campos.append("pagamento=%s")
+            valores.append(dados['pagamento'])
+        if 'parcelado' in dados:
+            campos.append("parcelado=%s")
+            valores.append(dados['parcelado'])
+        if 'parcela_total' in dados:
+            campos.append("parcela_total=%s")
+            valores.append(dados['parcela_total'])
+        if 'data_inicio' in dados:
+            campos.append("data_inicio=%s")
+            valores.append(dados['data_inicio'])
+        
+        if campos:
+            valores.append(fixo_id)
+            query = f"UPDATE fixos SET {', '.join(campos)} WHERE id=%s"
+            cur.execute(query, valores)
+            conn.commit()
+        
+        cur.close(); conn.close()
+        return jsonify({"sucesso": True}), 200
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route('/api/fixos/<int:fixo_id>', methods=['DELETE'])
+def deletar_fixo(fixo_id):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM fixos WHERE id=%s", (fixo_id,))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"sucesso": True}), 200
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route('/api/fixos/<int:fixo_id>/toggle', methods=['PATCH'])
+def toggle_fixo(fixo_id):
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        
+        cur.execute("SELECT ativo FROM fixos WHERE id=%s", (fixo_id,))
+        result = cur.fetchone()
+        if not result:
+            cur.close(); conn.close()
+            return jsonify({"erro": "Fixo não encontrado"}), 404
+        
+        novo_ativo = not result[0]
+        cur.execute("UPDATE fixos SET ativo=%s WHERE id=%s", (novo_ativo, fixo_id))
+        conn.commit(); cur.close(); conn.close()
+        
+        return jsonify({"sucesso": True, "ativo": novo_ativo}), 200
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
