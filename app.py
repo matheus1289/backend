@@ -5,6 +5,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import os
 import tempfile
+from pathlib import Path
 import psycopg2
 import psycopg2.extras
 
@@ -12,6 +13,7 @@ app = Flask(__name__, static_folder='../frontend', static_url_path='')
 CORS(app)
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / 'frontend'
 
 MESES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
          "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
@@ -101,6 +103,30 @@ def totais_fixos():
     return resultado
 
 # ── Rotas API ─────────────────────────────────────────────────────────────────
+
+@app.route('/api/health', methods=['GET'])
+def healthcheck():
+    """Healthcheck simples para validar API e conexão com banco."""
+    db_ok = False
+    db_error = None
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('SELECT 1')
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        db_error = str(e)
+
+    status = 200 if db_ok else 503
+    return jsonify({
+        'api': 'ok',
+        'database': 'ok' if db_ok else 'error',
+        'database_error': db_error
+    }), status
 
 @app.route('/api/adicionar-lancamento', methods=['POST'])
 def adicionar_lancamento():
@@ -454,11 +480,20 @@ def exportar_excel():
 
 @app.route('/')
 def index():
-    return send_from_directory('../frontend', 'index.html')
+    index_file = FRONTEND_DIR / 'index.html'
+    if index_file.exists():
+        return send_from_directory(str(FRONTEND_DIR), 'index.html')
+    return jsonify({
+        'api': 'online',
+        'message': 'Frontend não está neste deploy. Use os endpoints /api/*.'
+    }), 200
 
 @app.route('/<path:filename>')
 def static_files(filename):
-    return send_from_directory('../frontend', filename)
+    static_file = FRONTEND_DIR / filename
+    if static_file.exists():
+        return send_from_directory(str(FRONTEND_DIR), filename)
+    return jsonify({'erro': 'Arquivo não encontrado'}), 404
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
