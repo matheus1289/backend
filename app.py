@@ -66,6 +66,14 @@ def init_db():
             );
         """)
 
+        # Migra schema antigo de fixos sem exigir recriacao de tabela.
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcelado BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcela_atual INTEGER DEFAULT 1")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcela_total INTEGER DEFAULT 1")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS data_inicio VARCHAR(10)")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()")
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS lancamentos_gerados (
                 id               SERIAL PRIMARY KEY,
