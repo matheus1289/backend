@@ -79,6 +79,23 @@ def init_db():
     cur.close()
     conn.close()
 
+
+def bootstrap_database():
+    """Inicializa o banco no startup (incluindo deploy com Gunicorn)."""
+    if not DATABASE_URL:
+        print("  ⚠️  DATABASE_URL não definida!")
+        return
+
+    try:
+        init_db()
+        print("  ✅ Tabelas verificadas/criadas")
+    except Exception as e:
+        print(f"  ❌ Erro ao iniciar banco: {e}")
+
+
+# Garante init do banco também quando o app roda via Gunicorn.
+bootstrap_database()
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def mes_da_data(data_str):
@@ -504,15 +521,9 @@ if __name__ == '__main__':
     print("="*55)
 
     if not DATABASE_URL:
-        print("  ⚠️  DATABASE_URL não definida!")
         print("  Configure a variável de ambiente no Railway.")
     else:
         print("  ✅ Banco de dados conectado")
-        try:
-            init_db()
-            print("  ✅ Tabelas verificadas/criadas")
-        except Exception as e:
-            print(f"  ❌ Erro ao iniciar banco: {e}")
 
     print("  🚀 Rodando em http://0.0.0.0:5000")
     print("="*55 + "\n")
