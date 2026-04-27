@@ -1,11 +1,15 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import os
+import re
 import tempfile
 from pathlib import Path
+from functools import wraps
+import jwt
+import bcrypt
 import psycopg2
 import psycopg2.extras
 
@@ -14,6 +18,8 @@ CORS(app)
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / 'frontend'
+JWT_SECRET = os.environ.get('JWT_SECRET', 'chave-secreta-financeiro')
+JWT_EXPIRATION_DAYS = 7
 
 MESES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
          "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
@@ -35,8 +41,19 @@ def init_db():
         cur.execute("SELECT pg_advisory_lock(%s)", (lock_id,))
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id         SERIAL PRIMARY KEY,
+                nome       VARCHAR(100) NOT NULL,
+                email      VARCHAR(150) UNIQUE NOT NULL,
+                senha_hash VARCHAR(255) NOT NULL,
+                criado_em  TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS lancamentos (
                 id         SERIAL PRIMARY KEY,
+                user_id    INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
                 mes        VARCHAR(20),
                 data       VARCHAR(20),
                 descricao  TEXT NOT NULL,
@@ -52,6 +69,7 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS fixos (
                 id               SERIAL PRIMARY KEY,
+                user_id          INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
                 tipo             VARCHAR(10) NOT NULL,
                 descricao        TEXT NOT NULL,
                 valor            NUMERIC(12,2) NOT NULL,
@@ -66,6 +84,10 @@ def init_db():
             );
         """)
 
+        # Migra schema de usuários para estruturas existentes.
+        cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS user_id INTEGER")
+
         # Migra schema antigo de fixos sem exigir recriacao de tabela.
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcelado BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcela_atual INTEGER DEFAULT 1")
@@ -78,6 +100,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS lancamentos_gerados (
                 id               SERIAL PRIMARY KEY,
                 fixo_id          INTEGER REFERENCES fixos(id) ON DELETE CASCADE,
+                user_id          INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
                 mes              VARCHAR(20),
                 ano              INTEGER,
                 valor            NUMERIC(12,2),
@@ -85,24 +108,10 @@ def init_db():
             );
         """)
 
-        # Insere fixos padrão se tabela estiver vazia
-        cur.execute("SELECT COUNT(*) FROM fixos;")
-        if cur.fetchone()[0] == 0:
-            fixos_padrao = [
-                ('ENTRADA', 'Salário',          5000.00, 'Salário',           ''),
-                ('ENTRADA', 'Aluguel Imóvel',   1200.00, 'Outros (Entrada)',   ''),
-                ('ENTRADA', 'CDB/Dividendos',    300.00, 'Investimentos',      ''),
-                ('SAÍDA',   'Aluguel Apt.',     1500.00, 'Moradia',            'Débito Automático'),
-                ('SAÍDA',   'Plano de Saúde',    280.00, 'Saúde',              'Débito Automático'),
-                ('SAÍDA',   'Internet',          100.00, 'Contas/Serviços',    'Débito Automático'),
-                ('SAÍDA',   'Academia',           90.00, 'Saúde',              'Débito Automático'),
-                ('SAÍDA',   'Netflix',            45.00, 'Lazer',              'Cartão Crédito'),
-                ('SAÍDA',   'Spotify',            21.00, 'Lazer',              'Cartão Crédito'),
-            ]
-            cur.executemany("""
-                INSERT INTO fixos (tipo, descricao, valor, categoria, pagamento)
-                VALUES (%s, %s, %s, %s, %s)
-            """, fixos_padrao)
+        cur.execute("ALTER TABLE lancamentos_gerados ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lancamentos_user_id ON lancamentos(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fixos_user_id ON fixos(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lancamentos_gerados_user_id ON lancamentos_gerados(user_id)")
 
         conn.commit()
     finally:
@@ -142,7 +151,43 @@ def mes_da_data(data_str):
             continue
     return ""
 
-def verificar_e_gerar_parcelas(mes, ano):
+def validar_email(email):
+    return bool(re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email or ''))
+
+def validar_senha(senha):
+    if len(senha or '') < 8:
+        return False
+    return (
+        re.search(r'[A-Z]', senha)
+        and re.search(r'[a-z]', senha)
+        and re.search(r'\d', senha)
+    )
+
+def gerar_token(user_id, email):
+    payload = {
+        'user_id': user_id,
+        'email': email,
+        'exp': datetime.utcnow() + timedelta(days=JWT_EXPIRATION_DAYS)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+def requer_token(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization', '').replace('Bearer ', '').strip()
+        if not token:
+            return jsonify({'sucesso': False, 'mensagem': 'Token não fornecido'}), 401
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            request.user_id = payload['user_id']
+        except jwt.ExpiredSignatureError:
+            return jsonify({'sucesso': False, 'mensagem': 'Sessão expirada. Faça login novamente.'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'sucesso': False, 'mensagem': 'Token inválido'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+def verificar_e_gerar_parcelas(mes, ano, user_id):
     """Verifica fixos parcelados e gera lançamentos se necessário."""
     conn = get_conn()
     cur  = conn.cursor()
@@ -150,8 +195,8 @@ def verificar_e_gerar_parcelas(mes, ano):
     # Busca todos os fixos parcelados ativos
     cur.execute("""
         SELECT id, valor, parcela_atual, parcela_total, data_inicio, tipo
-        FROM fixos WHERE parcelado=TRUE AND ativo=TRUE
-    """)
+        FROM fixos WHERE user_id=%s AND parcelado=TRUE AND ativo=TRUE
+    """, (user_id,))
     fixos_parcelados = cur.fetchall()
     
     for fixo_id, valor, parcela_atual, parcela_total, data_inicio, tipo in fixos_parcelados:
@@ -161,8 +206,8 @@ def verificar_e_gerar_parcelas(mes, ano):
         # Verifica se já foi gerado para este mês
         cur.execute("""
             SELECT id FROM lancamentos_gerados 
-            WHERE fixo_id=%s AND mes=%s AND ano=%s
-        """, (fixo_id, mes, ano))
+            WHERE fixo_id=%s AND user_id=%s AND mes=%s AND ano=%s
+        """, (fixo_id, user_id, mes, ano))
         
         if cur.fetchone():
             # Já foi gerado, pula
@@ -182,29 +227,29 @@ def verificar_e_gerar_parcelas(mes, ano):
             if 0 <= meses_decorridos < parcela_total:
                 # Gera lançamento
                 cur.execute("""
-                    INSERT INTO lancamentos_gerados (fixo_id, mes, ano, valor)
-                    VALUES (%s, %s, %s, %s)
-                """, (fixo_id, mes, ano, valor))
+                    INSERT INTO lancamentos_gerados (fixo_id, user_id, mes, ano, valor)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (fixo_id, user_id, mes, ano, valor))
                 
                 # Atualiza parcela_atual
                 nova_parcela = meses_decorridos + 1
                 cur.execute("""
-                    UPDATE fixos SET parcela_atual=%s WHERE id=%s
-                """, (nova_parcela, fixo_id))
+                    UPDATE fixos SET parcela_atual=%s WHERE id=%s AND user_id=%s
+                """, (nova_parcela, fixo_id, user_id))
                 
                 # Se chegou no final, desativa
                 if nova_parcela >= parcela_total:
-                    cur.execute("UPDATE fixos SET ativo=FALSE WHERE id=%s", (fixo_id,))
+                    cur.execute("UPDATE fixos SET ativo=FALSE WHERE id=%s AND user_id=%s", (fixo_id, user_id))
         except ValueError:
             continue
     
     conn.commit(); cur.close(); conn.close()
 
-def totais_fixos():
+def totais_fixos(user_id):
     """Retorna total de rendas e gastos fixos."""
     conn = get_conn()
     cur  = conn.cursor()
-    cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE ativo=TRUE GROUP BY tipo")
+    cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE GROUP BY tipo", (user_id,))
     rows = cur.fetchall()
     cur.close(); conn.close()
     resultado = {'ENTRADA': 0.0, 'SAÍDA': 0.0}
@@ -238,7 +283,103 @@ def healthcheck():
         'database_error': db_error
     }), status
 
+@app.route('/api/auth/cadastro', methods=['POST'])
+def cadastro():
+    try:
+        dados = request.json or {}
+        nome = str(dados.get('nome', '')).strip()
+        email = str(dados.get('email', '')).strip().lower()
+        senha = str(dados.get('senha', ''))
+
+        if len(nome) < 2:
+            return jsonify({'sucesso': False, 'mensagem': 'Nome deve ter pelo menos 2 caracteres.'}), 400
+        if not validar_email(email):
+            return jsonify({'sucesso': False, 'mensagem': 'E-mail inválido.'}), 400
+        if not validar_senha(senha):
+            return jsonify({'sucesso': False, 'mensagem': 'Senha deve ter no mínimo 8 caracteres, com maiúscula, minúscula e número.'}), 400
+
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute('SELECT id FROM usuarios WHERE LOWER(email)=LOWER(%s)', (email,))
+        if cur.fetchone():
+            cur.close(); conn.close()
+            return jsonify({'sucesso': False, 'mensagem': 'Este e-mail já está cadastrado.'}), 409
+
+        senha_hash = bcrypt.hashpw(senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur.execute(
+            '''
+            INSERT INTO usuarios (nome, email, senha_hash)
+            VALUES (%s, %s, %s)
+            RETURNING id, nome, email
+            ''',
+            (nome, email, senha_hash)
+        )
+        usuario = cur.fetchone()
+        conn.commit()
+        cur.close(); conn.close()
+
+        token = gerar_token(usuario['id'], usuario['email'])
+        return jsonify({
+            'sucesso': True,
+            'mensagem': 'Cadastro realizado com sucesso!',
+            'token': token,
+            'usuario': {
+                'id': usuario['id'],
+                'nome': usuario['nome'],
+                'email': usuario['email']
+            }
+        }), 201
+
+    except Exception as e:
+        return jsonify({'sucesso': False, 'mensagem': str(e)}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    try:
+        dados = request.json or {}
+        email = str(dados.get('email', '')).strip().lower()
+        senha = str(dados.get('senha', ''))
+
+        if not email or not senha:
+            return jsonify({'sucesso': False, 'mensagem': 'E-mail e senha são obrigatórios.'}), 400
+
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            '''
+            SELECT id, nome, email, senha_hash
+            FROM usuarios
+            WHERE LOWER(email)=LOWER(%s)
+            ''',
+            (email,)
+        )
+        usuario = cur.fetchone()
+        cur.close(); conn.close()
+
+        credenciais_invalidas = (
+            not usuario
+            or not bcrypt.checkpw(senha.encode('utf-8'), usuario['senha_hash'].encode('utf-8'))
+        )
+        if credenciais_invalidas:
+            return jsonify({'sucesso': False, 'mensagem': 'E-mail ou senha incorretos'}), 401
+
+        token = gerar_token(usuario['id'], usuario['email'])
+        return jsonify({
+            'sucesso': True,
+            'mensagem': 'Login realizado com sucesso!',
+            'token': token,
+            'usuario': {
+                'id': usuario['id'],
+                'nome': usuario['nome'],
+                'email': usuario['email']
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'sucesso': False, 'mensagem': str(e)}), 500
+
 @app.route('/api/adicionar-lancamento', methods=['POST'])
+@requer_token
 def adicionar_lancamento():
     try:
         dados = request.json or {}
@@ -252,10 +393,11 @@ def adicionar_lancamento():
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute("""
-            INSERT INTO lancamentos (mes, data, descricao, categoria, tipo, valor, pagamento, obs)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO lancamentos (user_id, mes, data, descricao, categoria, tipo, valor, pagamento, obs)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
+            request.user_id,
             mes, dados['data'], dados['descricao'], dados['categoria'],
             tipo, float(dados['valor']),
             dados.get('pagamento', ''), dados.get('obs', '')
@@ -270,6 +412,7 @@ def adicionar_lancamento():
 
 
 @app.route('/api/lancamentos', methods=['GET'])
+@requer_token
 def listar_lancamentos():
     try:
         mes_filtro = request.args.get('mes', '').strip()
@@ -278,11 +421,11 @@ def listar_lancamentos():
 
         if mes_filtro:
             cur.execute("""
-                SELECT * FROM lancamentos WHERE LOWER(mes)=LOWER(%s)
+                SELECT * FROM lancamentos WHERE user_id=%s AND LOWER(mes)=LOWER(%s)
                 ORDER BY criado_em DESC
-            """, (mes_filtro,))
+            """, (request.user_id, mes_filtro))
         else:
-            cur.execute("SELECT * FROM lancamentos ORDER BY criado_em DESC")
+            cur.execute("SELECT * FROM lancamentos WHERE user_id=%s ORDER BY criado_em DESC", (request.user_id,))
 
         rows = cur.fetchall()
         cur.close(); conn.close()
@@ -308,13 +451,14 @@ def listar_lancamentos():
 
 
 @app.route('/api/lancamentos/<int:lancamento_id>', methods=['PUT'])
+@requer_token
 def editar_lancamento(lancamento_id):
     try:
         dados = request.json or {}
 
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM lancamentos WHERE id=%s", (lancamento_id,))
+        cur.execute("SELECT * FROM lancamentos WHERE id=%s AND user_id=%s", (lancamento_id, request.user_id))
         atual = cur.fetchone()
 
         if not atual:
@@ -348,8 +492,8 @@ def editar_lancamento(lancamento_id):
         cur2.execute("""
             UPDATE lancamentos
             SET mes=%s, data=%s, descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
-            WHERE id=%s
-        """, (mes, data, descricao, categoria, tipo, valor, pagamento, obs, lancamento_id))
+            WHERE id=%s AND user_id=%s
+        """, (mes, data, descricao, categoria, tipo, valor, pagamento, obs, lancamento_id, request.user_id))
 
         conn.commit()
         cur2.close(); cur.close(); conn.close()
@@ -361,11 +505,12 @@ def editar_lancamento(lancamento_id):
 
 
 @app.route('/api/lancamentos/<int:lancamento_id>', methods=['DELETE'])
+@requer_token
 def deletar_lancamento(lancamento_id):
     try:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM lancamentos WHERE id=%s", (lancamento_id,))
+        cur.execute("DELETE FROM lancamentos WHERE id=%s AND user_id=%s", (lancamento_id, request.user_id))
 
         if cur.rowcount == 0:
             conn.rollback(); cur.close(); conn.close()
@@ -380,6 +525,7 @@ def deletar_lancamento(lancamento_id):
 
 
 @app.route('/api/resumo', methods=['GET'])
+@requer_token
 def resumo():
     try:
         mes_filtro = request.args.get('mes', '').strip()
@@ -391,15 +537,15 @@ def resumo():
         # Gera parcelas se necessário
         if mes_filtro:
             ano = int(ano_filtro) if ano_filtro else datetime.now().year
-            verificar_e_gerar_parcelas(mes_filtro, ano)
+            verificar_e_gerar_parcelas(mes_filtro, ano, request.user_id)
 
         if mes_filtro:
             cur.execute("""
                 SELECT tipo, SUM(valor) FROM lancamentos
-                WHERE LOWER(mes)=LOWER(%s) GROUP BY tipo
-            """, (mes_filtro,))
+                WHERE user_id=%s AND LOWER(mes)=LOWER(%s) GROUP BY tipo
+            """, (request.user_id, mes_filtro))
         else:
-            cur.execute("SELECT tipo, SUM(valor) FROM lancamentos GROUP BY tipo")
+            cur.execute("SELECT tipo, SUM(valor) FROM lancamentos WHERE user_id=%s GROUP BY tipo", (request.user_id,))
 
         rows = cur.fetchall()
         
@@ -415,13 +561,13 @@ def resumo():
                        SUM(CASE WHEN f.tipo='SAÍDA' THEN lg.valor ELSE 0 END)
                 FROM lancamentos_gerados lg
                 JOIN fixos f ON lg.fixo_id = f.id
-                WHERE lg.mes=%s
-            """, (mes_filtro,))
+                WHERE lg.user_id=%s AND lg.mes=%s
+            """, (request.user_id, mes_filtro))
             entrada_parc, saida_parc = cur.fetchone()
             if entrada_parc: entradas += float(entrada_parc)
             if saida_parc: saidas += float(saida_parc)
 
-        fixos = totais_fixos()
+        fixos = totais_fixos(request.user_id)
         
         cur.close(); conn.close()
 
@@ -438,6 +584,7 @@ def resumo():
 
 
 @app.route('/api/categorias-resumo', methods=['GET'])
+@requer_token
 def categorias_resumo():
     try:
         mes_filtro = request.args.get('mes', '').strip()
@@ -447,15 +594,15 @@ def categorias_resumo():
         if mes_filtro:
             cur.execute("""
                 SELECT categoria, SUM(valor) FROM lancamentos
-                WHERE tipo='SAÍDA' AND LOWER(mes)=LOWER(%s)
+                WHERE user_id=%s AND tipo='SAÍDA' AND LOWER(mes)=LOWER(%s)
                 GROUP BY categoria ORDER BY SUM(valor) DESC
-            """, (mes_filtro,))
+            """, (request.user_id, mes_filtro))
         else:
             cur.execute("""
                 SELECT categoria, SUM(valor) FROM lancamentos
-                WHERE tipo='SAÍDA'
+                WHERE user_id=%s AND tipo='SAÍDA'
                 GROUP BY categoria ORDER BY SUM(valor) DESC
-            """)
+            """, (request.user_id,))
 
         rows = cur.fetchall()
         cur.close(); conn.close()
@@ -469,11 +616,12 @@ def categorias_resumo():
 
 
 @app.route('/api/meses-disponiveis', methods=['GET'])
+@requer_token
 def meses_disponiveis():
     try:
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute("SELECT DISTINCT mes FROM lancamentos WHERE mes IS NOT NULL")
+        cur.execute("SELECT DISTINCT mes FROM lancamentos WHERE user_id=%s AND mes IS NOT NULL", (request.user_id,))
         rows = cur.fetchall()
         cur.close(); conn.close()
 
@@ -486,6 +634,7 @@ def meses_disponiveis():
 
 
 @app.route('/api/listar-categorias', methods=['GET'])
+@requer_token
 def listar_categorias():
     return jsonify({
         "entrada": ["Salário","Freelance","Investimentos","Outros (Entrada)"],
@@ -495,6 +644,7 @@ def listar_categorias():
 
 
 @app.route('/api/listar-pagamentos', methods=['GET'])
+@requer_token
 def listar_pagamentos():
     return jsonify({"pagamentos": [
         "Dinheiro","Cartão Débito","Cartão Crédito",
@@ -503,6 +653,7 @@ def listar_pagamentos():
 
 
 @app.route('/api/fixos', methods=['GET'])
+@requer_token
 def listar_fixos():
     try:
         conn = get_conn()
@@ -510,8 +661,8 @@ def listar_fixos():
         cur.execute("""
             SELECT id, tipo, descricao, valor, categoria, pagamento, 
                    parcelado, parcela_atual, parcela_total, data_inicio, ativo
-            FROM fixos ORDER BY tipo, id
-        """)
+            FROM fixos WHERE user_id=%s ORDER BY tipo, id
+        """, (request.user_id,))
         rows = cur.fetchall()
         cur.close(); conn.close()
         
@@ -520,6 +671,7 @@ def listar_fixos():
         for r in rows:
             item = {
                 "id": r['id'],
+                "tipo": r['tipo'],
                 "descricao": r['descricao'],
                 "valor": float(r['valor']),
                 "categoria": r['categoria'],
@@ -541,6 +693,7 @@ def listar_fixos():
 
 
 @app.route('/api/fixos', methods=['POST'])
+@requer_token
 def adicionar_fixo():
     try:
         dados = request.json or {}
@@ -567,10 +720,11 @@ def adicionar_fixo():
         conn = get_conn()
         cur  = conn.cursor()
         cur.execute("""
-            INSERT INTO fixos (tipo, descricao, valor, categoria, pagamento, 
+            INSERT INTO fixos (user_id, tipo, descricao, valor, categoria, pagamento, 
                               parcelado, parcela_atual, parcela_total, data_inicio, ativo)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id
         """, (
+            request.user_id,
             tipo, dados['descricao'].strip(),
             float(dados['valor']), dados.get('categoria',''),
             dados.get('pagamento',''), parcelado,
@@ -584,6 +738,7 @@ def adicionar_fixo():
 
 
 @app.route('/api/fixos/<int:fixo_id>', methods=['PUT'])
+@requer_token
 def editar_fixo(fixo_id):
     try:
         dados = request.json or {}
@@ -592,7 +747,7 @@ def editar_fixo(fixo_id):
         cur  = conn.cursor()
         
         # Busca o fixo atual
-        cur.execute("SELECT * FROM fixos WHERE id=%s", (fixo_id,))
+        cur.execute("SELECT * FROM fixos WHERE id=%s AND user_id=%s", (fixo_id, request.user_id))
         fixo = cur.fetchone()
         if not fixo:
             cur.close(); conn.close()
@@ -626,7 +781,8 @@ def editar_fixo(fixo_id):
         
         if campos:
             valores.append(fixo_id)
-            query = f"UPDATE fixos SET {', '.join(campos)} WHERE id=%s"
+            valores.append(request.user_id)
+            query = f"UPDATE fixos SET {', '.join(campos)} WHERE id=%s AND user_id=%s"
             cur.execute(query, valores)
             conn.commit()
         
@@ -637,11 +793,12 @@ def editar_fixo(fixo_id):
 
 
 @app.route('/api/fixos/<int:fixo_id>', methods=['DELETE'])
+@requer_token
 def deletar_fixo(fixo_id):
     try:
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute("DELETE FROM fixos WHERE id=%s", (fixo_id,))
+        cur.execute("DELETE FROM fixos WHERE id=%s AND user_id=%s", (fixo_id, request.user_id))
         conn.commit(); cur.close(); conn.close()
         return jsonify({"sucesso": True}), 200
     except Exception as e:
@@ -649,19 +806,20 @@ def deletar_fixo(fixo_id):
 
 
 @app.route('/api/fixos/<int:fixo_id>/toggle', methods=['PATCH'])
+@requer_token
 def toggle_fixo(fixo_id):
     try:
         conn = get_conn()
         cur  = conn.cursor()
         
-        cur.execute("SELECT ativo FROM fixos WHERE id=%s", (fixo_id,))
+        cur.execute("SELECT ativo FROM fixos WHERE id=%s AND user_id=%s", (fixo_id, request.user_id))
         result = cur.fetchone()
         if not result:
             cur.close(); conn.close()
             return jsonify({"erro": "Fixo não encontrado"}), 404
         
         novo_ativo = not result[0]
-        cur.execute("UPDATE fixos SET ativo=%s WHERE id=%s", (novo_ativo, fixo_id))
+        cur.execute("UPDATE fixos SET ativo=%s WHERE id=%s AND user_id=%s", (novo_ativo, fixo_id, request.user_id))
         conn.commit(); cur.close(); conn.close()
         
         return jsonify({"sucesso": True, "ativo": novo_ativo}), 200
@@ -672,6 +830,7 @@ def toggle_fixo(fixo_id):
 # ── Exportar Excel ────────────────────────────────────────────────────────────
 
 @app.route('/api/exportar-excel', methods=['GET'])
+@requer_token
 def exportar_excel():
     try:
         mes_filtro = request.args.get('mes', '').strip()
@@ -682,16 +841,16 @@ def exportar_excel():
 
         if mes_filtro:
             cur.execute("""
-                SELECT * FROM lancamentos WHERE LOWER(mes)=LOWER(%s)
+                SELECT * FROM lancamentos WHERE user_id=%s AND LOWER(mes)=LOWER(%s)
                 ORDER BY criado_em ASC
-            """, (mes_filtro,))
+            """, (request.user_id, mes_filtro))
         else:
-            cur.execute("SELECT * FROM lancamentos ORDER BY criado_em ASC")
+            cur.execute("SELECT * FROM lancamentos WHERE user_id=%s ORDER BY criado_em ASC", (request.user_id,))
 
         lancamentos = [dict(r) for r in cur.fetchall()]
         cur.close(); conn.close()
 
-        fixos = totais_fixos()
+        fixos = totais_fixos(request.user_id)
         renda_fixa   = fixos['ENTRADA']
         gastos_fixos = fixos['SAÍDA']
 
