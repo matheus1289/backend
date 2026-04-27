@@ -568,13 +568,14 @@ def resumo():
             if saida_parc: saidas += float(saida_parc)
 
         fixos = totais_fixos(request.user_id)
+        entradas_dashboard = entradas + fixos['ENTRADA']
         saidas_dashboard = saidas + fixos['SAÍDA']
-        saldo_dashboard = (entradas + fixos['ENTRADA']) - saidas_dashboard
+        saldo_dashboard = entradas_dashboard - saidas_dashboard
         
         cur.close(); conn.close()
 
         return jsonify({
-            "entradas":     round(entradas, 2),
+            "entradas":     round(entradas_dashboard, 2),
             "saidas":       round(saidas_dashboard, 2),
             "saldo":        round(saldo_dashboard, 2),
             "renda_fixa":   round(fixos['ENTRADA'], 2),
