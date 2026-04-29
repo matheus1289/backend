@@ -975,9 +975,9 @@ def exportar_excel():
 
 @app.route('/')
 def index():
-    index_file = FRONTEND_DIR / 'index.html'
+    index_file = FRONTEND_DIR / 'financas.html'
     if index_file.exists():
-        return send_from_directory(str(FRONTEND_DIR), 'index.html')
+        return send_from_directory(str(FRONTEND_DIR), 'financas.html')
     return jsonify({
         'api': 'online',
         'message': 'Frontend não está neste deploy. Use os endpoints /api/*.'
