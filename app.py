@@ -539,6 +539,10 @@ def resumo():
             ano = int(ano_filtro) if ano_filtro else datetime.now().year
             verificar_e_gerar_parcelas(mes_filtro, ano, request.user_id)
 
+        # Conta quantos meses existem para média
+        cur.execute("SELECT COUNT(DISTINCT mes) FROM lancamentos WHERE user_id=%s", (request.user_id,))
+        num_meses = cur.fetchone()[0] or 1
+
         if mes_filtro:
             cur.execute("""
                 SELECT tipo, SUM(valor) FROM lancamentos
@@ -554,6 +558,11 @@ def resumo():
             if tipo == 'ENTRADA': entradas = float(total or 0)
             elif tipo == 'SAÍDA': saidas   = float(total or 0)
 
+        # Se for "Todos os meses", tiramos a média dos lançamentos
+        if not mes_filtro:
+            entradas = entradas / num_meses
+            saidas = saidas / num_meses
+
         # Adiciona lançamentos gerados de fixos parcelados
         if mes_filtro:
             cur.execute("""
@@ -566,8 +575,21 @@ def resumo():
             entrada_parc, saida_parc = cur.fetchone()
             if entrada_parc: entradas += float(entrada_parc)
             if saida_parc: saidas += float(saida_parc)
+        else:
+            # Para "Todos os meses", somamos todos os gerados e dividimos pelos meses
+            cur.execute("""
+                SELECT SUM(CASE WHEN f.tipo='ENTRADA' THEN lg.valor ELSE 0 END),
+                       SUM(CASE WHEN f.tipo='SAÍDA' THEN lg.valor ELSE 0 END)
+                FROM lancamentos_gerados lg
+                JOIN fixos f ON lg.fixo_id = f.id
+                WHERE lg.user_id=%s
+            """, (request.user_id,))
+            entrada_parc, saida_parc = cur.fetchone()
+            if entrada_parc: entradas += float(entrada_parc) / num_meses
+            if saida_parc: saidas += float(saida_parc) / num_meses
 
         fixos = totais_fixos(request.user_id)
+        # Fixos já são mensais por natureza
         entradas_dashboard = entradas + fixos['ENTRADA']
         saidas_dashboard = saidas + fixos['SAÍDA']
         saldo_dashboard = entradas_dashboard - saidas_dashboard
@@ -580,6 +602,7 @@ def resumo():
             "saldo":        round(saldo_dashboard, 2),
             "renda_fixa":   round(fixos['ENTRADA'], 2),
             "gastos_fixos": round(fixos['SAÍDA'],   2),
+            "num_meses":    num_meses
         }), 200
 
     except Exception as e:
@@ -594,25 +617,92 @@ def categorias_resumo():
         conn = get_conn()
         cur  = conn.cursor()
 
+        # Conta meses para média
+        cur.execute("SELECT COUNT(DISTINCT mes) FROM lancamentos WHERE user_id=%s", (request.user_id,))
+        num_meses = cur.fetchone()[0] or 1
+
+        # 1. Busca gastos de lançamentos manuais (sempre variáveis)
         if mes_filtro:
             cur.execute("""
                 SELECT categoria, SUM(valor) FROM lancamentos
                 WHERE user_id=%s AND tipo='SAÍDA' AND LOWER(mes)=LOWER(%s)
-                GROUP BY categoria ORDER BY SUM(valor) DESC
+                GROUP BY categoria
             """, (request.user_id, mes_filtro))
         else:
             cur.execute("""
                 SELECT categoria, SUM(valor) FROM lancamentos
                 WHERE user_id=%s AND tipo='SAÍDA'
-                GROUP BY categoria ORDER BY SUM(valor) DESC
+                GROUP BY categoria
             """, (request.user_id,))
+        
+        dict_variaveis = {r[0]: float(r[1]) for r in cur.fetchall()}
 
-        rows = cur.fetchall()
+        # Se for "Todos os meses", tiramos a média dos lançamentos por categoria
+        if not mes_filtro:
+            for cat in dict_variaveis:
+                dict_variaveis[cat] = dict_variaveis[cat] / num_meses
+
+        dict_fixos = {}
+
+        # 2. Busca gastos de fixos recorrentes e gerados (fixos)
+        if mes_filtro:
+            # Fixos recorrentes ativos
+            cur.execute("""
+                SELECT categoria, SUM(valor) FROM fixos
+                WHERE user_id=%s AND tipo='SAÍDA' AND ativo=TRUE AND parcelado=FALSE
+                GROUP BY categoria
+            """, (request.user_id,))
+            for cat, total in cur.fetchall():
+                dict_fixos[cat] = dict_fixos.get(cat, 0.0) + float(total)
+
+            # Gastos gerados (parcelados) para aquele mês
+            cur.execute("""
+                SELECT f.categoria, SUM(lg.valor)
+                FROM lancamentos_gerados lg
+                JOIN fixos f ON lg.fixo_id = f.id
+                WHERE lg.user_id=%s AND f.tipo='SAÍDA' AND lg.mes=%s
+                GROUP BY f.categoria
+            """, (request.user_id, mes_filtro))
+            for cat, total in cur.fetchall():
+                dict_fixos[cat] = dict_fixos.get(cat, 0.0) + float(total)
+        else:
+            # No modo "Todos", somamos os fixos recorrentes ativos
+            cur.execute("""
+                SELECT categoria, SUM(valor) FROM fixos
+                WHERE user_id=%s AND tipo='SAÍDA' AND ativo=TRUE AND parcelado=FALSE
+                GROUP BY categoria
+            """, (request.user_id,))
+            for cat, total in cur.fetchall():
+                dict_fixos[cat] = dict_fixos.get(cat, 0.0) + float(total)
+
+            # E somamos a média dos parcelados já gerados
+            cur.execute("""
+                SELECT f.categoria, SUM(lg.valor)
+                FROM lancamentos_gerados lg
+                JOIN fixos f ON lg.fixo_id = f.id
+                WHERE lg.user_id=%s AND f.tipo='SAÍDA'
+                GROUP BY f.categoria
+            """, (request.user_id,))
+            for cat, total in cur.fetchall():
+                dict_fixos[cat] = dict_fixos.get(cat, 0.0) + (float(total) / num_meses)
+
         cur.close(); conn.close()
 
-        return jsonify({"categorias": [
-            {"categoria": r[0], "total": float(r[1])} for r in rows
-        ]}), 200
+        # Une os dicionários
+        todas_categorias = set(list(dict_variaveis.keys()) + list(dict_fixos.keys()))
+        lista_final = []
+        for cat in todas_categorias:
+            v = dict_variaveis.get(cat, 0.0)
+            f = dict_fixos.get(cat, 0.0)
+            lista_final.append({
+                "categoria": cat,
+                "total": v + f,
+                "variavel": v,
+                "fixo": f
+            })
+
+        lista_final.sort(key=lambda x: x['total'], reverse=True)
+        return jsonify({"categorias": lista_final}), 200
 
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
@@ -640,9 +730,9 @@ def meses_disponiveis():
 @requer_token
 def listar_categorias():
     return jsonify({
-        "entrada": ["Salário","Freelance","Investimentos","Outros (Entrada)"],
-        "saida":   ["Alimentação","Fast Food","Moradia","Transporte","Veiculo","Gasolina","Saúde","Educação",
-                    "Lazer","Vestuário","Contas/Serviços","Outros (Saída)"]
+        "entrada": ["Salário","Freelance","Investimentos","Prêmio/Bônus","Outros (Entrada)"],
+        "saida":   ["Alimentação","Fast Food","Mercado","Moradia","Transporte","Veiculo","Gasolina","Saúde","Educação",
+                    "Lazer","Vestuário","Assinaturas","Beleza","Pet","Presentes","Contas/Serviços","Outros (Saída)"]
     }), 200
 
 
