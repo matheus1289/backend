@@ -641,7 +641,7 @@ def meses_disponiveis():
 def listar_categorias():
     return jsonify({
         "entrada": ["Salário","Freelance","Investimentos","Outros (Entrada)"],
-        "saida":   ["Alimentação","Fast Food","Moradia","Transporte""Veiculo","Gasolina","Saúde","Educação",
+        "saida":   ["Alimentação","Fast Food","Moradia","Transporte","Veiculo","Gasolina","Saúde","Educação",
                     "Lazer","Vestuário","Contas/Serviços","Outros (Saída)"]
     }), 200
 
