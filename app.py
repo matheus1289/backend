@@ -87,6 +87,12 @@ def init_db():
         # Migra schema de usuários para estruturas existentes.
         cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS user_id INTEGER")
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        
+        # Migra schema de lançamentos parcelados
+        cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS parcelado BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS parcela_atual INTEGER")
+        cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS total_parcelas INTEGER")
+        cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS id_grupo_parcela VARCHAR(100)")
 
         # Migra schema antigo de fixos sem exigir recriacao de tabela.
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcelado BOOLEAN DEFAULT FALSE")
@@ -382,30 +388,45 @@ def login():
 @requer_token
 def adicionar_lancamento():
     try:
-        dados = request.json or {}
-        for campo in ['data', 'descricao', 'categoria', 'tipo', 'valor']:
-            if not str(dados.get(campo, '')).strip():
-                return jsonify({"erro": f"Campo obrigatório: {campo}"}), 400
-
-        mes  = mes_da_data(str(dados['data']))
-        tipo = dados['tipo'].upper()
-
+        dados_input = request.json or {}
+        lista_dados = dados_input if isinstance(dados_input, list) else [dados_input]
+        
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO lancamentos (user_id, mes, data, descricao, categoria, tipo, valor, pagamento, obs)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (
-            request.user_id,
-            mes, dados['data'], dados['descricao'], dados['categoria'],
-            tipo, float(dados['valor']),
-            dados.get('pagamento', ''), dados.get('obs', '')
-        ))
-        novo_id = cur.fetchone()[0]
+        ids_inseridos = []
+        mes_retorno = None
+
+        for dados in lista_dados:
+            for campo in ['data', 'descricao', 'categoria', 'tipo', 'valor']:
+                if not str(dados.get(campo, '')).strip():
+                    conn.rollback(); cur.close(); conn.close()
+                    return jsonify({"erro": f"Campo obrigatório: {campo}"}), 400
+
+            mes  = mes_da_data(str(dados['data']))
+            if not mes_retorno: mes_retorno = mes
+            tipo = dados['tipo'].upper()
+            
+            parcelado = bool(dados.get('parcelado', False))
+            parcela_atual = int(dados.get('parcelaAtual')) if parcelado and dados.get('parcelaAtual') else None
+            total_parcelas = int(dados.get('totalParcelas')) if parcelado and dados.get('totalParcelas') else None
+            id_grupo_parcela = str(dados.get('idGrupoParcela', '')) if parcelado else None
+
+            cur.execute("""
+                INSERT INTO lancamentos (user_id, mes, data, descricao, categoria, tipo, valor, pagamento, obs, parcelado, parcela_atual, total_parcelas, id_grupo_parcela)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                request.user_id,
+                mes, dados['data'], dados['descricao'], dados['categoria'],
+                tipo, float(dados['valor']),
+                dados.get('pagamento', ''), dados.get('obs', ''),
+                parcelado, parcela_atual, total_parcelas, id_grupo_parcela
+            ))
+            ids_inseridos.append(cur.fetchone()[0])
+            
         conn.commit(); cur.close(); conn.close()
 
-        return jsonify({"sucesso": True, "mensagem": "Lançamento adicionado!", "id": novo_id, "mes": mes}), 201
+        return jsonify({"sucesso": True, "mensagem": "Lançamento(s) adicionado(s)!", "id": ids_inseridos[0] if ids_inseridos else None, "mes": mes_retorno}), 201
 
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
@@ -433,16 +454,33 @@ def listar_lancamentos():
         lancamentos = []
         for r in rows:
             lancamentos.append({
-                "id":        r['id'],
-                "mes":       r['mes'],
-                "data":      r['data'],
-                "descricao": r['descricao'],
-                "categoria": r['categoria'],
-                "tipo":      r['tipo'],
-                "valor":     float(r['valor']),
-                "pagamento": r['pagamento'],
-                "obs":       r['obs'],
+                "id":               r['id'],
+                "mes":              r['mes'],
+                "data":             r['data'],
+                "descricao":        r['descricao'],
+                "categoria":        r['categoria'],
+                "tipo":             r['tipo'],
+                "valor":            float(r['valor']),
+                "pagamento":        r['pagamento'],
+                "obs":              r['obs'],
+                "parcelado":        r.get('parcelado', False),
+                "parcela_atual":    r.get('parcela_atual', None),
+                "total_parcelas":   r.get('total_parcelas', None),
+                "id_grupo_parcela": r.get('id_grupo_parcela', None)
             })
+
+        def sort_key(x):
+            date_str = x['data'] or ''
+            dt = None
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y"):
+                try:
+                    dt = datetime.strptime(date_str.strip(), fmt)
+                    break
+                except (ValueError, AttributeError):
+                    pass
+            return (dt or datetime.min, x['id'])
+
+        lancamentos.sort(key=sort_key, reverse=True)
 
         return jsonify({"lancamentos": lancamentos, "total": len(lancamentos)}), 200
 
@@ -488,12 +526,35 @@ def editar_lancamento(lancamento_id):
             cur.close(); conn.close()
             return jsonify({"erro": "Data inválida"}), 400
 
+        abrangencia = str(dados.get('abrangencia', 'UNICA')).upper()
+        
         cur2 = conn.cursor()
-        cur2.execute("""
-            UPDATE lancamentos
-            SET mes=%s, data=%s, descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
-            WHERE id=%s AND user_id=%s
-        """, (mes, data, descricao, categoria, tipo, valor, pagamento, obs, lancamento_id, request.user_id))
+        
+        if atual['parcelado'] and atual['id_grupo_parcela'] and abrangencia != 'UNICA':
+            cur2.execute("""
+                UPDATE lancamentos
+                SET mes=%s, data=%s, descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
+                WHERE id=%s AND user_id=%s
+            """, (mes, data, descricao, categoria, tipo, valor, pagamento, obs, lancamento_id, request.user_id))
+            
+            if abrangencia == 'TODAS':
+                cur2.execute("""
+                    UPDATE lancamentos
+                    SET descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
+                    WHERE id_grupo_parcela=%s AND user_id=%s AND id != %s
+                """, (descricao, categoria, tipo, valor, pagamento, obs, atual['id_grupo_parcela'], request.user_id, lancamento_id))
+            elif abrangencia == 'PROXIMAS':
+                cur2.execute("""
+                    UPDATE lancamentos
+                    SET descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
+                    WHERE id_grupo_parcela=%s AND user_id=%s AND parcela_atual > %s
+                """, (descricao, categoria, tipo, valor, pagamento, obs, atual['id_grupo_parcela'], request.user_id, atual['parcela_atual']))
+        else:
+            cur2.execute("""
+                UPDATE lancamentos
+                SET mes=%s, data=%s, descricao=%s, categoria=%s, tipo=%s, valor=%s, pagamento=%s, obs=%s
+                WHERE id=%s AND user_id=%s
+            """, (mes, data, descricao, categoria, tipo, valor, pagamento, obs, lancamento_id, request.user_id))
 
         conn.commit()
         cur2.close(); cur.close(); conn.close()
@@ -508,13 +569,24 @@ def editar_lancamento(lancamento_id):
 @requer_token
 def deletar_lancamento(lancamento_id):
     try:
+        abrangencia = request.args.get('abrangencia', 'UNICA').upper()
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM lancamentos WHERE id=%s AND user_id=%s", (lancamento_id, request.user_id))
-
-        if cur.rowcount == 0:
+        
+        cur.execute("SELECT parcelado, id_grupo_parcela, parcela_atual FROM lancamentos WHERE id=%s AND user_id=%s", (lancamento_id, request.user_id))
+        atual = cur.fetchone()
+        
+        if not atual:
             conn.rollback(); cur.close(); conn.close()
             return jsonify({"erro": "Lançamento não encontrado"}), 404
+            
+        if atual[0] and atual[1] and abrangencia != 'UNICA':
+            if abrangencia == 'TODAS':
+                cur.execute("DELETE FROM lancamentos WHERE id_grupo_parcela=%s AND user_id=%s", (atual[1], request.user_id))
+            elif abrangencia == 'PROXIMAS':
+                cur.execute("DELETE FROM lancamentos WHERE id_grupo_parcela=%s AND user_id=%s AND parcela_atual >= %s", (atual[1], request.user_id, atual[2]))
+        else:
+            cur.execute("DELETE FROM lancamentos WHERE id=%s AND user_id=%s", (lancamento_id, request.user_id))
 
         conn.commit()
         cur.close(); conn.close()
