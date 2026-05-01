@@ -246,10 +246,10 @@ def verificar_e_gerar_parcelas(mes, ano, user_id):
     conn.commit(); cur.close(); conn.close()
 
 def totais_fixos(user_id):
-    """Retorna total de rendas e gastos fixos."""
+    """Retorna total de rendas e gastos fixos (apenas recorrentes, sem parcelados)."""
     conn = get_conn()
     cur  = conn.cursor()
-    cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE GROUP BY tipo", (user_id,))
+    cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE AND parcelado=FALSE GROUP BY tipo", (user_id,))
     rows = cur.fetchall()
     cur.close(); conn.close()
     resultado = {'ENTRADA': 0.0, 'SAÍDA': 0.0}
@@ -563,6 +563,9 @@ def resumo():
             entradas = entradas / num_meses
             saidas = saidas / num_meses
 
+        entrada_parc_val = 0.0
+        saida_parc_val = 0.0
+
         # Adiciona lançamentos gerados de fixos parcelados
         if mes_filtro:
             cur.execute("""
@@ -570,11 +573,13 @@ def resumo():
                        SUM(CASE WHEN f.tipo='SAÍDA' THEN lg.valor ELSE 0 END)
                 FROM lancamentos_gerados lg
                 JOIN fixos f ON lg.fixo_id = f.id
-                WHERE lg.user_id=%s AND lg.mes=%s
+                WHERE lg.user_id=%s AND LOWER(lg.mes)=LOWER(%s)
             """, (request.user_id, mes_filtro))
             entrada_parc, saida_parc = cur.fetchone()
-            if entrada_parc: entradas += float(entrada_parc)
-            if saida_parc: saidas += float(saida_parc)
+            if entrada_parc: entrada_parc_val = float(entrada_parc)
+            if saida_parc: saida_parc_val = float(saida_parc)
+            entradas += entrada_parc_val
+            saidas += saida_parc_val
         else:
             # Para "Todos os meses", somamos todos os gerados e dividimos pelos meses
             cur.execute("""
@@ -585,8 +590,10 @@ def resumo():
                 WHERE lg.user_id=%s
             """, (request.user_id,))
             entrada_parc, saida_parc = cur.fetchone()
-            if entrada_parc: entradas += float(entrada_parc) / num_meses
-            if saida_parc: saidas += float(saida_parc) / num_meses
+            if entrada_parc: entrada_parc_val = float(entrada_parc) / num_meses
+            if saida_parc: saida_parc_val = float(saida_parc) / num_meses
+            entradas += entrada_parc_val
+            saidas += saida_parc_val
 
         fixos = totais_fixos(request.user_id)
         # Fixos já são mensais por natureza
@@ -600,8 +607,8 @@ def resumo():
             "entradas":     round(entradas_dashboard, 2),
             "saidas":       round(saidas_dashboard, 2),
             "saldo":        round(saldo_dashboard, 2),
-            "renda_fixa":   round(fixos['ENTRADA'], 2),
-            "gastos_fixos": round(fixos['SAÍDA'],   2),
+            "renda_fixa":   round(fixos['ENTRADA'] + entrada_parc_val, 2),
+            "gastos_fixos": round(fixos['SAÍDA'] + saida_parc_val,   2),
             "num_meses":    num_meses
         }), 200
 
