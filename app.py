@@ -130,6 +130,22 @@ def init_db():
         conn.close()
 
 
+def migrar_meses():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id, data FROM lancamentos WHERE mes NOT LIKE '% %'")
+        rows = cur.fetchall()
+        for r in rows:
+            if r[1]:
+                novo_mes = mes_da_data(r[1])
+                if novo_mes:
+                    cur.execute("UPDATE lancamentos SET mes=%s WHERE id=%s", (novo_mes, r[0]))
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception as e:
+        print(f"  ❌ Erro ao migrar meses: {e}")
+
 def bootstrap_database():
     """Inicializa o banco no startup (incluindo deploy com Gunicorn)."""
     if not DATABASE_URL:
@@ -138,10 +154,10 @@ def bootstrap_database():
 
     try:
         init_db()
+        migrar_meses()
         print("  ✅ Tabelas verificadas/criadas")
     except Exception as e:
         print(f"  ❌ Erro ao iniciar banco: {e}")
-
 
 # Garante init do banco também quando o app roda via Gunicorn.
 bootstrap_database()
@@ -152,7 +168,7 @@ def mes_da_data(data_str):
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"):
         try:
             dt = datetime.strptime(data_str.strip(), fmt)
-            return MESES[dt.month - 1]
+            return f"{MESES[dt.month - 1]} {dt.year}"
         except ValueError:
             continue
     return ""
@@ -608,8 +624,10 @@ def resumo():
 
         # Gera parcelas se necessário
         if mes_filtro:
-            ano = int(ano_filtro) if ano_filtro else datetime.now().year
-            verificar_e_gerar_parcelas(mes_filtro, ano, request.user_id)
+            partes = mes_filtro.split()
+            nome_mes = partes[0]
+            ano = int(partes[1]) if len(partes) > 1 else int(ano_filtro) if ano_filtro else datetime.now().year
+            verificar_e_gerar_parcelas(nome_mes, ano, request.user_id)
 
         # Conta quantos meses existem para média
         cur.execute("SELECT COUNT(DISTINCT mes) FROM lancamentos WHERE user_id=%s", (request.user_id,))
@@ -645,8 +663,8 @@ def resumo():
                        SUM(CASE WHEN f.tipo='SAÍDA' THEN lg.valor ELSE 0 END)
                 FROM lancamentos_gerados lg
                 JOIN fixos f ON lg.fixo_id = f.id
-                WHERE lg.user_id=%s AND LOWER(lg.mes)=LOWER(%s)
-            """, (request.user_id, mes_filtro))
+                WHERE lg.user_id=%s AND LOWER(lg.mes)=LOWER(%s) AND lg.ano=%s
+            """, (request.user_id, nome_mes, ano))
             entrada_parc, saida_parc = cur.fetchone()
             if entrada_parc: entrada_parc_val = float(entrada_parc)
             if saida_parc: saida_parc_val = float(saida_parc)
@@ -699,6 +717,14 @@ def categorias_resumo():
         # Conta meses para média
         cur.execute("SELECT COUNT(DISTINCT mes) FROM lancamentos WHERE user_id=%s", (request.user_id,))
         num_meses = cur.fetchone()[0] or 1
+        
+        nome_mes = ""
+        ano = datetime.now().year
+        if mes_filtro:
+            partes = mes_filtro.split()
+            nome_mes = partes[0]
+            if len(partes) > 1:
+                ano = int(partes[1])
 
         # 1. Busca gastos de lançamentos manuais (sempre variáveis)
         if mes_filtro:
@@ -739,9 +765,9 @@ def categorias_resumo():
                 SELECT f.categoria, SUM(lg.valor)
                 FROM lancamentos_gerados lg
                 JOIN fixos f ON lg.fixo_id = f.id
-                WHERE lg.user_id=%s AND f.tipo='SAÍDA' AND lg.mes=%s
+                WHERE lg.user_id=%s AND f.tipo='SAÍDA' AND LOWER(lg.mes)=LOWER(%s) AND lg.ano=%s
                 GROUP BY f.categoria
-            """, (request.user_id, mes_filtro))
+            """, (request.user_id, nome_mes, ano))
             for cat, total in cur.fetchall():
                 dict_fixos[cat] = dict_fixos.get(cat, 0.0) + float(total)
         else:
@@ -795,10 +821,28 @@ def meses_disponiveis():
         cur  = conn.cursor()
         cur.execute("SELECT DISTINCT mes FROM lancamentos WHERE user_id=%s AND mes IS NOT NULL", (request.user_id,))
         rows = cur.fetchall()
+        meses_set = set(r[0] for r in rows if r[0])
+        
+        cur.execute("SELECT DISTINCT mes, ano FROM lancamentos_gerados WHERE user_id=%s AND mes IS NOT NULL", (request.user_id,))
+        rows_lg = cur.fetchall()
+        for r in rows_lg:
+            if r[0] and r[1]:
+                meses_set.add(f"{r[0]} {r[1]}")
+                
         cur.close(); conn.close()
 
-        ordem = {m: i for i, m in enumerate(MESES)}
-        meses = sorted([r[0] for r in rows if r[0]], key=lambda m: ordem.get(m, 99))
+        def mes_key(m_str):
+            partes = m_str.split()
+            if len(partes) >= 2:
+                try:
+                    ano = int(partes[1])
+                    mes_idx = MESES.index(partes[0].capitalize())
+                    return (ano, mes_idx)
+                except ValueError:
+                    pass
+            return (9999, 99)
+
+        meses = sorted(list(meses_set), key=mes_key)
         return jsonify({"meses": meses}), 200
 
     except Exception as e:
