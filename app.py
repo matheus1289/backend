@@ -85,6 +85,7 @@ def init_db():
         """)
 
         # Migra schema de usuários para estruturas existentes.
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS compromissos_pago TEXT DEFAULT '{}'")
         cur.execute("ALTER TABLE lancamentos ADD COLUMN IF NOT EXISTS user_id INTEGER")
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS user_id INTEGER")
         
@@ -1042,6 +1043,42 @@ def toggle_fixo(fixo_id):
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
+
+# ── Compromissos Pago ─────────────────────────────────────────────────────────
+
+@app.route('/api/compromissos-pago', methods=['GET'])
+@requer_token
+def get_compromissos_pago():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT compromissos_pago FROM usuarios WHERE id=%s", (request.user_id,))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        estado = row[0] if row and row[0] else "{}"
+        import json
+        return jsonify({"sucesso": True, "estado": json.loads(estado)}), 200
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+@app.route('/api/compromissos-pago', methods=['PUT'])
+@requer_token
+def set_compromissos_pago():
+    try:
+        dados = request.json or {}
+        estado = dados.get('estado', {})
+        import json
+        estado_str = json.dumps(estado)
+
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE usuarios SET compromissos_pago=%s WHERE id=%s", (estado_str, request.user_id))
+        conn.commit()
+        cur.close(); conn.close()
+
+        return jsonify({"sucesso": True}), 200
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
 # ── Exportar Excel ────────────────────────────────────────────────────────────
 
