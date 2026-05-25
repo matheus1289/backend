@@ -282,6 +282,11 @@ def totais_fixos(user_id):
 
 # ── Rotas API ─────────────────────────────────────────────────────────────────
 
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Rota extremamente leve para manter o serviço acordado no Render."""
+    return 'ok', 200
+
 @app.route('/api/health', methods=['GET'])
 def healthcheck():
     """Healthcheck simples para validar API e conexão com banco."""
