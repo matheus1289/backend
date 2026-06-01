@@ -296,8 +296,9 @@ def totais_fixos(user_id, mes_ref=None):
                 SELECT tipo, SUM(valor) FROM fixos
                 WHERE user_id=%s AND parcelado=FALSE
                   AND (ativo=TRUE OR encerrado_em > %s)
+                  AND DATE_TRUNC('month', criado_em) <= %s
                 GROUP BY tipo
-            """, (user_id, data_ref))
+            """, (user_id, data_ref, data_ref))
         else:
             cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE AND parcelado=FALSE GROUP BY tipo", (user_id,))
     else:
@@ -794,8 +795,9 @@ def categorias_resumo():
                     SELECT categoria, SUM(valor) FROM fixos
                     WHERE user_id=%s AND tipo='SAÍDA' AND parcelado=FALSE
                       AND (ativo=TRUE OR encerrado_em > %s)
+                      AND DATE_TRUNC('month', criado_em) <= %s
                     GROUP BY categoria
-                """, (request.user_id, data_ref))
+                """, (request.user_id, data_ref, data_ref))
             else:
                 cur.execute("""
                     SELECT categoria, SUM(valor) FROM fixos
