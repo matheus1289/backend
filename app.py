@@ -101,6 +101,7 @@ def init_db():
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS parcela_total INTEGER DEFAULT 1")
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS data_inicio VARCHAR(10)")
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE")
+        cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS encerrado_em DATE")
         cur.execute("ALTER TABLE fixos ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()")
 
         cur.execute("""
@@ -173,6 +174,16 @@ def mes_da_data(data_str):
         except ValueError:
             continue
     return ""
+
+def primeiro_dia_mes(mes_str):
+    """Converte 'Janeiro 2026' para um objeto date(2026, 1, 1)."""
+    try:
+        partes = mes_str.strip().split()
+        mes_idx = MESES.index(partes[0].capitalize()) + 1
+        ano = int(partes[1])
+        return datetime(ano, mes_idx, 1).date()
+    except (ValueError, IndexError):
+        return None
 
 def validar_email(email):
     return bool(re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email or ''))
@@ -268,11 +279,29 @@ def verificar_e_gerar_parcelas(mes, ano, user_id):
     
     conn.commit(); cur.close(); conn.close()
 
-def totais_fixos(user_id):
-    """Retorna total de rendas e gastos fixos (apenas recorrentes, sem parcelados)."""
+def totais_fixos(user_id, mes_ref=None):
+    """Retorna total de rendas e gastos fixos (apenas recorrentes, sem parcelados).
+
+    mes_ref: string 'Mês Ano' ex: 'Janeiro 2026'.
+    Quando fornecido, inclui fixos encerrados APÓS o primeiro dia daquele mês,
+    garantindo que o histórico retroativo seja preservado.
+    Quando omitido, retorna apenas os fixos atualmente ativos (ativo=TRUE).
+    """
     conn = get_conn()
     cur  = conn.cursor()
-    cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE AND parcelado=FALSE GROUP BY tipo", (user_id,))
+    if mes_ref:
+        data_ref = primeiro_dia_mes(mes_ref)
+        if data_ref:
+            cur.execute("""
+                SELECT tipo, SUM(valor) FROM fixos
+                WHERE user_id=%s AND parcelado=FALSE
+                  AND (ativo=TRUE OR encerrado_em > %s)
+                GROUP BY tipo
+            """, (user_id, data_ref))
+        else:
+            cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE AND parcelado=FALSE GROUP BY tipo", (user_id,))
+    else:
+        cur.execute("SELECT tipo, SUM(valor) FROM fixos WHERE user_id=%s AND ativo=TRUE AND parcelado=FALSE GROUP BY tipo", (user_id,))
     rows = cur.fetchall()
     cur.close(); conn.close()
     resultado = {'ENTRADA': 0.0, 'SAÍDA': 0.0}
@@ -691,7 +720,8 @@ def resumo():
             entradas += entrada_parc_val
             saidas += saida_parc_val
 
-        fixos = totais_fixos(request.user_id)
+        # Passa o mês de referência para incluir fixos encerrados naquele período
+        fixos = totais_fixos(request.user_id, mes_ref=mes_filtro if mes_filtro else None)
         # Fixos já são mensais por natureza
         entradas_dashboard = entradas + fixos['ENTRADA']
         saidas_dashboard = saidas + fixos['SAÍDA']
@@ -757,12 +787,21 @@ def categorias_resumo():
 
         # 2. Busca gastos de fixos recorrentes e gerados (fixos)
         if mes_filtro:
-            # Fixos recorrentes ativos
-            cur.execute("""
-                SELECT categoria, SUM(valor) FROM fixos
-                WHERE user_id=%s AND tipo='SAÍDA' AND ativo=TRUE AND parcelado=FALSE
-                GROUP BY categoria
-            """, (request.user_id,))
+            # Fixos recorrentes: inclui ativos E encerrados após o início do mês consultado
+            data_ref = primeiro_dia_mes(mes_filtro)
+            if data_ref:
+                cur.execute("""
+                    SELECT categoria, SUM(valor) FROM fixos
+                    WHERE user_id=%s AND tipo='SAÍDA' AND parcelado=FALSE
+                      AND (ativo=TRUE OR encerrado_em > %s)
+                    GROUP BY categoria
+                """, (request.user_id, data_ref))
+            else:
+                cur.execute("""
+                    SELECT categoria, SUM(valor) FROM fixos
+                    WHERE user_id=%s AND tipo='SAÍDA' AND ativo=TRUE AND parcelado=FALSE
+                    GROUP BY categoria
+                """, (request.user_id,))
             for cat, total in cur.fetchall():
                 dict_fixos[cat] = dict_fixos.get(cat, 0.0) + float(total)
 
@@ -881,9 +920,9 @@ def listar_fixos():
         conn = get_conn()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT id, tipo, descricao, valor, categoria, pagamento, 
+            SELECT id, tipo, descricao, valor, categoria, pagamento,
                    parcelado, parcela_atual, parcela_total, data_inicio, ativo
-            FROM fixos WHERE user_id=%s ORDER BY tipo, id
+            FROM fixos WHERE user_id=%s AND ativo=TRUE ORDER BY tipo, id
         """, (request.user_id,))
         rows = cur.fetchall()
         cur.close(); conn.close()
@@ -1017,10 +1056,20 @@ def editar_fixo(fixo_id):
 @app.route('/api/fixos/<int:fixo_id>', methods=['DELETE'])
 @requer_token
 def deletar_fixo(fixo_id):
+    """Soft delete: marca o fixo como inativo e registra a data de encerramento.
+    O histórico de meses anteriores é preservado nas queries do dashboard.
+    """
     try:
+        from datetime import date
         conn = get_conn()
         cur  = conn.cursor()
-        cur.execute("DELETE FROM fixos WHERE id=%s AND user_id=%s", (fixo_id, request.user_id))
+        cur.execute(
+            "UPDATE fixos SET ativo=FALSE, encerrado_em=%s WHERE id=%s AND user_id=%s",
+            (date.today(), fixo_id, request.user_id)
+        )
+        if cur.rowcount == 0:
+            conn.rollback(); cur.close(); conn.close()
+            return jsonify({"erro": "Fixo não encontrado"}), 404
         conn.commit(); cur.close(); conn.close()
         return jsonify({"sucesso": True}), 200
     except Exception as e:
@@ -1041,7 +1090,19 @@ def toggle_fixo(fixo_id):
             return jsonify({"erro": "Fixo não encontrado"}), 404
         
         novo_ativo = not result[0]
-        cur.execute("UPDATE fixos SET ativo=%s WHERE id=%s AND user_id=%s", (novo_ativo, fixo_id, request.user_id))
+        if novo_ativo:
+            # Reativação: limpa a data de encerramento
+            cur.execute(
+                "UPDATE fixos SET ativo=%s, encerrado_em=NULL WHERE id=%s AND user_id=%s",
+                (novo_ativo, fixo_id, request.user_id)
+            )
+        else:
+            # Desativação via toggle: registra encerrado_em
+            from datetime import date
+            cur.execute(
+                "UPDATE fixos SET ativo=%s, encerrado_em=%s WHERE id=%s AND user_id=%s",
+                (novo_ativo, date.today(), fixo_id, request.user_id)
+            )
         conn.commit(); cur.close(); conn.close()
         
         return jsonify({"sucesso": True, "ativo": novo_ativo}), 200
